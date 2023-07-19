@@ -56,6 +56,11 @@ MBEDTLS_STATIC_LIB = {
     'TLS': 'library/libmbedtls.a',
 }
 
+CC = {
+    'armclang': 'armclang',
+    'armgcc': 'arm-none-eabi-gcc',
+}
+
 DETECT_ARCH_CMD = "cc -dM -E - < /dev/null"
 def detect_arch() -> str:
     """Auto-detect host architecture."""
@@ -308,10 +313,12 @@ class CodeSizeComparison(CodeSizeBase):
 
         my_environment = os.environ.copy()
         try:
+            print("Run: {}".format(self.make_clean))
             subprocess.check_output(
                 self.make_clean, env=my_environment, shell=True,
                 cwd=git_worktree_path, stderr=subprocess.STDOUT,
             )
+            print("Run: {}".format(self.make_command))
             subprocess.check_output(
                 self.make_command, env=my_environment, shell=True,
                 cwd=git_worktree_path, stderr=subprocess.STDOUT,
@@ -406,6 +413,272 @@ class CodeSizeComparison(CodeSizeBase):
         self._remove_worktree(git_worktree_path)
         sys.exit(-1)
 
+
+def parse_obj_file(file_name: str):
+    CMD = ['arm-none-eabi-objdump', '-t']
+    PATTERN_DICT = {
+        'value': r'(?P<value>[0-9a-f]+)',
+        'flag': r'(?P<flag>.{7})',
+        'section': r'(?P<section>.*)',
+        'size': r'(?P<size>[0-9a-f]+)',
+        'vsblt': r'(?P<vsblt>\.[^ ]*)',
+        'name': r'(?P<name>.*)'
+    }
+    PATTERN = '{value} {flag} {section}\t{size} ({vsblt} )?{name}'.format(**PATTERN_DICT)
+    if os.path.exists(file_name):
+        CMD.append(file_name)
+        result = subprocess.check_output(CMD).decode()
+        for line in result.splitlines():
+            match = re.match(PATTERN, line)
+            if match is not None:
+                yield match['name'], match['flag'], match['size'], match['section']
+
+
+class SymbolSize:
+    def __init__(self, name: str, type: str, size: int, section_str: str) -> None:
+        self.name = name
+        self.type = type
+        self.size = size
+        self.section_str = section_str
+        self.section = '.{}'.format(self.section_str.split('.')[1])
+
+    def to_dict(self):
+        return self.__dict__
+
+
+class ObjectSize:
+    def __init__(self, file_name: str, size: SizeEntry) -> None:
+        self.name = os.path.basename(file_name)
+        self.file_name = file_name
+        self.size = size
+        self.sym_sum = {"text": 0, "rodata": 0, "data": 0, "bss": 0, "total": 0}
+        """
+        symbols = {
+            name : SymbolSize
+        }
+        """
+        self.symbols = {} # type: typing.Dict[str, typing.Dict[str, SymbolSize]]
+        self._get_symbol_size()
+    
+    def _get_symbol_size(self) -> None:
+        TYPE_DICT = {
+            'F': 'FUNC', 'O': 'OBJ', ' ': 'NORM'
+        }
+        for name, flag, size, section in parse_obj_file(self.file_name):
+            # flag[0]: 'l': local, 'g': global, 'u': unique global, '!': global & local, ' ': neither global nor local
+            # flag[5]: 'd': debug, 'D': dynamic
+            # flag[6]: 'F': function, 'f': file, 'O': object, ' ': normal
+            if flag == ' '*7 or flag[5] == 'd':
+                continue
+            sym_type = TYPE_DICT.get(flag[-1], '')
+            sym_size = self.symbols.setdefault(name, SymbolSize(name, sym_type, int(size, 16), section))
+            self.sym_sum[sym_size.section[1:]] += sym_size.size
+        self.sym_sum['text'] += self.sym_sum['rodata']
+        self.sym_sum['total'] = self.sym_sum['text'] + self.sym_sum['data'] + self.sym_sum['bss']
+
+
+class BuildInfo:
+    def __init__(self, toolchain: str, profile: str, opt_level: str, rev: str) -> None:
+        self.toolchain = toolchain
+        self.profile = profile
+        self.opt_level = opt_level
+        self.rev = rev
+        self.cflags = []
+        self.make_command = ['make', '-j', 'lib']
+        self._generate_make_command()
+
+    def _generate_cflag(self) -> None:
+        # set target
+        if (self.toolchain == 'armclang'):
+            self.cflags.append('--target=arm-arm-none-eabi')
+        # elif (self.toolchain == 'armgcc'):
+        #     self.cflags.append('-funwind-tables')
+        self.cflags.append('-mcpu=cortex-m33')
+        # set optimization level
+        self.cflags.append('-O{}'.format(self.opt_level))
+        # set config
+        if (self.profile == SupportedConfig.TFM_MEDIUM.value):
+            self.cflags.append(r'-DMBEDTLS_CONFIG_FILE=\"' + CONFIG_TFM_MEDIUM_MBEDCRYPTO_H + r'\"')
+            self.cflags.append(r'-DMBEDTLS_PSA_CRYPTO_CONFIG_FILE=\"' + CONFIG_TFM_MEDIUM_PSA_CRYPTO_H + r'\"')
+
+    def _generate_make_command(self) -> None:
+        self._generate_cflag()
+        self.make_command.append('CC={}'.format(CC[self.toolchain]))
+        self.make_command.append('CFLAGS=\'{}\''.format(' '.join(self.cflags)))
+
+
+class ToolchainComparison(CodeSizeComparison):
+    """Compare code size between two Git revisions."""
+
+    def __init__(
+            self,
+            build_info_1: BuildInfo,
+            build_info_2: BuildInfo,
+            result_dir: str,
+            code_size_info: CodeSizeInfo
+    ) -> None:
+        """
+        old_revision: revision to compare against.
+        new_revision:
+        result_dir: directory for comparison result.
+        code_size_info: an object containing information to build library.
+        """
+        super().__init__(build_info_1.rev, build_info_2.rev, result_dir, code_size_info)
+
+        self.git_command = "git"
+        self.make_clean = 'make clean'
+        self.make_command = ''
+        self.build_info = [build_info_1, build_info_2]
+        self.fname_suffix = ''
+        self.git_worktree_path = ''
+
+    def set_size_record(self, compare_key: str, mod: str, size_text: str) -> None:
+        """Store size information for target revision and high-level module.
+
+        size_text Format: text data bss dec hex filename
+        """
+        """
+        code_size = {
+            compare_key : {
+                mod : {
+                    obj_name: ObjectSize
+                }
+            }
+        }
+        """ 
+        size_record = {}
+        for line in size_text.splitlines()[1:]:
+            data = line.split()
+            size_erntry = SizeEntry(int(data[0]), int(data[1]), int(data[2]), int(data[3]))
+            file_name = os.path.join(self.git_worktree_path, 'library', data[5])
+            size_record[data[5]] = ObjectSize(file_name, size_erntry)
+        self.code_size.setdefault(compare_key, {}).update({mod: size_record})
+
+    def write_size_record(
+            self,
+            compare_key: str,
+            output: typing_util.Writable
+    ) -> None:
+        """Write size information to a file.
+
+        Writing Format: file_name text data bss total(dec)
+        """
+        TITLE = ["filename", "text", "data", "bss", "total"]
+        LINE_FORMAT = "{filename:<50} {text:>7} {data:>7} {bss:>7} {total:>7}\n"
+        LINE_FORMAT_sym = "{name:>50} {type:>7} {size:>7} {section:>7} {section_str:>7}\n"
+        output.write(LINE_FORMAT
+                    .format(**{t:t for t in TITLE}))
+        for _, fname, obj_size in self._size_reader_helper(compare_key, output):
+            output.write(LINE_FORMAT.format(**{'filename': fname, **obj_size.size.__dict__}))
+            output.write(LINE_FORMAT.format(**{'filename': fname, **obj_size.sym_sum}))
+            for _, sym_size in obj_size.symbols.items():
+                output.write(LINE_FORMAT_sym.format(**sym_size.to_dict()))
+
+    def _get_code_size(self, build_info: BuildInfo) -> None:
+        """Generate code size csv file for the specified git revision."""
+        self.fname_suffix = '_' + \
+            '_'.join(['armv8-m', build_info.profile, build_info.toolchain])
+        self.make_command = " ".join(build_info.make_command)
+        revision = build_info.rev
+        self.git_worktree_path = self._create_git_worktree(revision)
+        try:
+            self._build_libraries(self.git_worktree_path)
+            self._gen_code_size_csv(build_info.toolchain, self.git_worktree_path)
+        finally:
+            self._remove_worktree(self.git_worktree_path)
+        self.fname_suffix = ''
+        self.git_worktree_path = ''
+
+    def _gen_code_size_comparison(self) -> int:
+        """Generate results of the size changes between two revisions,
+        old and new. Measured code size results of these two revisions
+        must be available."""
+
+        res_file = open(os.path.join(self.result_dir, "compare-" + self.build_info[0].rev + \
+                                     "_" + self.build_info[0].toolchain + \
+                                     "_" + self.build_info[1].toolchain + \
+                                     "_" + "armv8-m" + "_" + self.build_info[0].profile + \
+                                     ".csv"), "w")
+
+        print("\nGenerating comparison results between",\
+                self.old_rev, "and", self.new_rev)
+        self.write_comparison(self.build_info[0].toolchain, self.build_info[1].toolchain, res_file)
+
+        return 0
+
+    def get_comparision_results(self) -> int:
+        """Compare size of library/*.o between self.old_rev and self.new_rev,
+        and generate the result file."""
+        build_tree.check_repo_path()
+        self._get_code_size(self.build_info[0])
+        self._get_code_size(self.build_info[1])
+        return self._gen_code_size_comparison()
+
+    def write_comparison(
+            self,
+            old_key: str,
+            new_key: str,
+            output: typing_util.Writable
+    ) -> None:
+        """Write comparison result into a file.
+
+        Writing Format: file_name current(total) old(total) change(Byte) change_pct(%)
+        """
+        cal_change_pct = lambda o, n: (n - o) / o if o != 0 else 0
+        sort_tc = lambda item : item[1][new_key].sym_sum['total'] - item[1][old_key].sym_sum['total']
+        filt_gz = lambda item : not (item[1][old_key].sym_sum['total'] == item[1][new_key].sym_sum['total'] == 0)
+        header_format = "| {:<30} | {:>10} | {:>10} | {:>10} | {:>10} |\n"
+        line_format = "| {:<30} | {:>10} | {:>10} | {:>10} | {:>10.2%} |\n"
+        total_key = '(TOTALS)'
+        def output_data2(fname, code_size):
+            old_size = code_size[old_key].sym_sum['total']
+            new_size = code_size[new_key].sym_sum['total']
+            change = new_size - old_size
+            change_pct = cal_change_pct(old_size, new_size)
+            return [fname, old_size, new_size, change, change_pct]
+        def output_data(fname, code_size):
+            old_size = code_size[old_key].size.total
+            new_size = code_size[new_key].size.total
+            # exid_size = 8*len([1 for symbol in code_size['armclang'].symbols.items() if symbol[1].type == 'FUNC'])
+            # if old_key == 'armclang':
+            #     old_size -= exid_size
+            # elif new_key == 'armclang':
+            #     new_size -= exid_size
+            change = new_size - old_size
+            change_pct = cal_change_pct(old_size, new_size)
+            return [fname, old_size, new_size, change, change_pct]
+
+        for mod in MBEDTLS_STATIC_LIB.keys():
+            # convert to :
+            # {
+            #     file_name : {
+            #         old_key: SizeEntry,
+            #         new_key: SizeEntry
+            #     }
+            # }
+            mod_res = { f:{old_key:self.code_size[old_key][mod][f],
+                           new_key:self.code_size[new_key][mod][f]}
+                        for f in self.code_size[old_key][mod].keys()
+                      }
+
+            for f, code_size in mod_res.items():
+                exid_size = 8*len([1 for symbol in code_size['armclang'].symbols.items() if symbol[1].type == 'FUNC'])
+                mod_res[f]['armclang'].size.total -= exid_size
+                mod_res[f]['armclang'].size.text -= exid_size
+                mod_res[total_key]['armclang'].size.total -= exid_size
+                mod_res[total_key]['armclang'].size.text -= exid_size
+
+            output.write("\n" + mod + "\n")
+            output.write(header_format.format("filename", old_key, new_key, "change", "change%"))
+            output.write(header_format.format(":---", "---:", "---:", "---:", "---:"))
+            output.write(line_format.format(*output_data(total_key, mod_res[total_key])))
+            mod_res.pop(total_key)
+            for fname, code_size in sorted(filter(filt_gz, mod_res.items()),
+                                           reverse=True, key=sort_tc):
+                output.write(line_format.format(*output_data(fname, code_size)))
+                # output.write(line_format.format(*output_data2(fname, code_size)))
+
+
 def main():
     parser = argparse.ArgumentParser(description=(__doc__))
     group_required = parser.add_argument_group(
@@ -458,6 +731,12 @@ def main():
     result_dir = comp_args.result_dir
     size_compare = CodeSizeComparison(old_revision, new_revision, result_dir,
                                       code_size_info)
+    if new_revision == old_revision:
+        build_info_1 = BuildInfo('armgcc', code_size_info.config, 's', new_revision)
+        build_info_2 = BuildInfo('armclang', code_size_info.config, 'z', new_revision)
+        size_compare = ToolchainComparison(build_info_1, build_info_2, result_dir, code_size_info)
+        return_code = size_compare.get_comparision_results()
+        sys.exit(return_code)
     return_code = size_compare.get_comparision_results()
     sys.exit(return_code)
 
