@@ -49,6 +49,7 @@ int main(void)
 #define DFL_SERVER_NAME         "localhost"
 #define DFL_SERVER_ADDR         NULL
 #define DFL_SERVER_PORT         "4433"
+#define DFL_REQUEST_FILE        ""
 #define DFL_REQUEST_PAGE        "/"
 #define DFL_REQUEST_SIZE        -1
 #define DFL_DEBUG_LEVEL         0
@@ -390,6 +391,7 @@ int main(void)
     "    server_name=%%s      default: localhost\n"         \
     "    server_addr=%%s      default: given by name\n"     \
     "    server_port=%%d      default: 4433\n"              \
+    "    request_file=%%s     default: \"\"\n"              \
     "    request_page=%%s     default: \".\"\n"             \
     "    request_size=%%d     default: about 34 (basic request)\n"           \
     "                        (minimum: 0, max: " MAX_REQUEST_SIZE_STR ")\n"  \
@@ -484,6 +486,7 @@ struct options {
     uint32_t read_timeout;      /* timeout on mbedtls_ssl_read() in milliseconds     */
     int max_resend;             /* DTLS times to resend on read timeout     */
     const char *request_page;   /* page on server to request                */
+    const char *request_file;   /* page on server to request                */
     int request_size;           /* pad request with header to requested size */
     const char *ca_file;        /* the file with the CA certificate(s)      */
     const char *ca_path;        /* the path with the CA certificate(s) reside */
@@ -904,6 +907,7 @@ usage:
     opt.max_resend          = DFL_MAX_RESEND;
     opt.request_page        = DFL_REQUEST_PAGE;
     opt.request_size        = DFL_REQUEST_SIZE;
+    opt.request_file        = DFL_REQUEST_FILE;
     opt.ca_file             = DFL_CA_FILE;
     opt.ca_path             = DFL_CA_PATH;
     opt.crt_file            = DFL_CRT_FILE;
@@ -1031,6 +1035,8 @@ usage:
             }
         } else if (strcmp(p, "request_page") == 0) {
             opt.request_page = q;
+        } else if (strcmp(p, "request_file") == 0) {
+            opt.request_file = q;
         } else if (strcmp(p, "request_size") == 0) {
             opt.request_size = atoi(q);
             if (opt.request_size < 0 ||
@@ -2430,32 +2436,64 @@ send_request:
     mbedtls_printf("  > Write to server:");
     fflush(stdout);
 
-    len = mbedtls_snprintf((char *) buf, sizeof(buf) - 1, GET_REQUEST,
-                           opt.request_page);
-    tail_len = (int) strlen(GET_REQUEST_END);
+    if (strcmp(opt.request_file, DFL_REQUEST_FILE) == 0) {
+        len = mbedtls_snprintf((char *) buf, sizeof(buf) - 1, GET_REQUEST,
+                               opt.request_page);
+        tail_len = (int) strlen(GET_REQUEST_END);
 
-    /* Add padding to GET request to reach opt.request_size in length */
-    if (opt.request_size != DFL_REQUEST_SIZE &&
-        len + tail_len < opt.request_size) {
-        memset(buf + len, 'A', opt.request_size - len - tail_len);
-        len += opt.request_size - len - tail_len;
+        /* Add padding to GET request to reach opt.request_size in length */
+        if (opt.request_size != DFL_REQUEST_SIZE &&
+            len + tail_len < opt.request_size) {
+            memset(buf + len, 'A', opt.request_size - len - tail_len);
+            len += opt.request_size - len - tail_len;
+        }
+
+        strncpy((char *) buf + len, GET_REQUEST_END, sizeof(buf) - len - 1);
+        len += tail_len;
+
+        /* Truncate if request size is smaller than the "natural" size */
+        if (opt.request_size != DFL_REQUEST_SIZE &&
+            len > opt.request_size) {
+            len = opt.request_size;
+
+            /* Still end with \r\n unless that's really not possible */
+            if (len >= 2) {
+                buf[len - 2] = '\r';
+            }
+            if (len >= 1) {
+                buf[len - 1] = '\n';
+            }
+        }
     }
+    else {
+        FILE* req_file = NULL;
+        long size = 0;
 
-    strncpy((char *) buf + len, GET_REQUEST_END, sizeof(buf) - len - 1);
-    len += tail_len;
-
-    /* Truncate if request size is smaller than the "natural" size */
-    if (opt.request_size != DFL_REQUEST_SIZE &&
-        len > opt.request_size) {
-        len = opt.request_size;
-
-        /* Still end with \r\n unless that's really not possible */
-        if (len >= 2) {
-            buf[len - 2] = '\r';
+        if ((req_file = fopen(opt.request_file, "r")) == NULL) {
+            mbedtls_printf("failed\n  ! Cannot open '%s'.\n", opt.request_file);
+            fclose(req_file);
+            goto exit;
         }
-        if (len >= 1) {
-            buf[len - 1] = '\n';
+
+        fseek(req_file, 0, SEEK_END);
+        if ((size = ftell(req_file)) == -1) {
+            mbedtls_printf("failed\n  ! No content in '%s'.\n", opt.request_file);
+            fclose(req_file);
+            goto exit;
+        }else if (size > MAX_REQUEST_SIZE)
+        {
+            mbedtls_printf("failed\n  ! Request exceed limits.\n");
+            fclose(req_file);
+            goto exit;
         }
+        fseek(req_file, 0, SEEK_SET);
+
+        if ((len = fread(buf, 1, size, req_file)) != size) {
+            mbedtls_printf("failed\n  ! Cannot read file '%s'.\n", opt.request_file);
+            fclose(req_file);
+            goto exit;
+        }
+
     }
 
     if (opt.transport == MBEDTLS_SSL_TRANSPORT_STREAM) {
