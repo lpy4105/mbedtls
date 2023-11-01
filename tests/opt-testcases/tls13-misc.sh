@@ -500,3 +500,74 @@ run_test "TLS 1.3 m->m: Resumption with ticket flags, psk_all/psk_all." \
          -s "found matched identity" \
          -s "key exchange mode: psk_ephemeral"
 
+requires_gnutls_tls1_3
+requires_all_configs_enabled MBEDTLS_SSL_PROTO_TLS1_3 MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE MBEDTLS_SSL_SRV_C MBEDTLS_DEBUG_C
+requires_config_enabled MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_ENABLED
+requires_config_enabled MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED
+requires_config_enabled MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL_ENABLED
+run_test    "TLS 1.3: Resumption: G->m: psk_or_ephemeral/all, good" \
+            "$P_SRV tls13_kex_modes=all debug_level=5 $(get_srv_psk_list)" \
+            "$G_NEXT_CLI -d 10 --priority NORMAL:-VERS-ALL:-KX-ALL:-ECDHE-PSK:-DHE-PSK:+PSK:+VERS-TLS1.3 \
+                         --pskusername Client_identity --pskkey=6162636465666768696a6b6c6d6e6f70 \
+                         -r localhost" \
+            0 \
+            -c "sent PSK identity 'Client_identity' (0)" \
+            -C "selected PSK mode" \
+            -c "Selected group" \
+            -c "sent PSK resumption identity (0)" \
+            -c "sent PSK identity 'Client_identity' (1)" \
+            -c "selected PSK-resumption mode" \
+            -c "This is a resumed session"
+
+requires_gnutls_tls1_3
+run_test    "TLS 1.3: Resumption: G->G: psk_or_ephemeral/all, good" \
+            "$G_NEXT_SRV -d 4 --priority=NORMAL:-VERS-ALL:+VERS-TLS1.3:-KX-ALL:+ECDHE-PSK:+DHE-PSK:+PSK \
+                         --pskpasswd=data_files/simplepass.psk" \
+            "$G_NEXT_CLI -d 10 --priority NORMAL:-VERS-ALL:-KX-ALL:-ECDHE-PSK:-DHE-PSK:+PSK:+VERS-TLS1.3 \
+                         --pskusername Client_identity --pskkey=6162636465666768696a6b6c6d6e6f70 \
+                         -r localhost" \
+            0 \
+            -c "sent PSK identity 'Client_identity' (0)" \
+            -c "selected PSK mode" \
+            -C "Selected group" \
+            -c "sent PSK resumption identity (0)" \
+            -c "sent PSK identity 'Client_identity' (1)" \
+            -c "selected PSK-resumption mode" \
+            -c "This is a resumed session"
+
+requires_all_configs_enabled MBEDTLS_SSL_PROTO_TLS1_3 MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE \
+                             MBEDTLS_SSL_CLI_C MBEDTLS_SSL_CLI_C MBEDTLS_DEBUG_C
+requires_config_enabled MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_ENABLED
+requires_config_enabled MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED
+requires_config_enabled MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_EPHEMERAL_ENABLED
+run_test    "TLS 1.3: Resumption: m->m: psk_or_ephemeral/all, good" \
+            "$P_SRV tls13_kex_modes=all debug_level=5 $(get_srv_psk_list)" \
+            "$P_CLI debug_level=4 tls13_kex_modes=psk_or_ephemeral \
+                    psk_identity=Client_identity psk=6162636465666768696a6b6c6d6e6f70 \
+                    reconnect=1" \
+            0 \
+            -c "PSK is configured" \
+            -c "Pre-configured PSK number = 1" \
+            -c "Selected key exchange mode: ephemeral" \
+            -c "Ticket is configured" \
+            -c "Pre-configured PSK number = 2" \
+            -c "Selected key exchange mode: psk$" \
+            -C "Selected key exchange mode: psk_ephemeral"
+
+requires_gnutls_tls1_3
+requires_all_configs_enabled MBEDTLS_SSL_PROTO_TLS1_3 MBEDTLS_SSL_TLS1_3_COMPATIBILITY_MODE MBEDTLS_SSL_CLI_C MBEDTLS_DEBUG_C
+requires_config_enabled MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_PSK_ENABLED
+requires_config_enabled MBEDTLS_SSL_TLS1_3_KEY_EXCHANGE_MODE_EPHEMERAL_ENABLED
+run_test    "TLS 1.3: Resumption: m->G: psk_or_ephemeral/all, good" \
+            "$G_NEXT_SRV -d 4 --priority=NORMAL:-VERS-ALL:+VERS-TLS1.3:-KX-ALL:+ECDHE-PSK:+DHE-PSK:+PSK \
+                         --pskpasswd=data_files/simplepass.psk" \
+            "$P_CLI debug_level=4 tls13_kex_modes=psk_or_ephemeral \
+                    psk_identity=Client_identity psk=6162636465666768696a6b6c6d6e6f70 \
+                    reconnect=1" \
+            0 \
+            -c "PSK is configured" \
+            -c "Pre-configured PSK number = 1" \
+            -c "Ticket is configured" \
+            -c "Pre-configured PSK number = 2" \
+            -c "Selected key exchange mode: psk$" \
+            -C "Selected key exchange mode: psk_ephemeral"
